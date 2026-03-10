@@ -30,7 +30,7 @@ CISS Manager lets you search across CISS case years (2017–2024) by vehicle mak
 | **Model** | Specific model — filtered by selected make |
 | **Damage Plane** | Front, Back, Left, Right, Top, Undercarriage, or Any |
 | **Model Year Min/Max** | Optional range filter on the vehicle's model year |
-| **Delta-V Min/Max** | Optional range filter in mph — uses CDC DV preferred, EDR as fallback |
+| **Delta-V Min/Max** | Optional range filter in mph — uses CDC DV preferred, EDR as fallback. Note this is a positive resultant of longitudinal and lateral |
 | **Vehicle contacts only** | When a damage plane is selected, filters to vehicle-to-vehicle contacts only (excludes fixed objects, pedestrians, etc.) |
 
 ---
@@ -148,4 +148,18 @@ pandas
 streamlit>=1.35.0
 pyreadstat
 altair>=5.0.0
+```
+
+## Fun Facts on CISS Database Learned
+
+```
+There are occasional edge cases where the CISS Web Search function disagrees with the background data documents. One such instance is CASEID 12257, a 2011 Ford Escape's front contacts the rear of a 2018 Ford Escape. If you do a test run of rear damage to 2018 Ford Escapes in this search feature it will inform you that vehicle #2 of this CASEID experienced a rear contact with a CDC delta-V of 12 kph. However on the CISS website, you will see crush measurements taken for Vehicle #2 however the CDC delta-V is assigned to Vehicle #1 which disagrees with the background data.
+
+EDR data is reportedly automatically uploaded from Bosch CDR files into the system during the inspection process. There are rare errors, so please verify. 
+
+CASEID was chosen as it is more easily repopulated into the CISS search function per their website and utilized in their URLs vs other case identifiers.
+
+The US is partitioned into 1,784 PSUs at last count.
+
+For damage profiles, Rear of Cab and Back (rear of tractor) are only applicable to TDC applicable vehicles and medium/heavy trucks.
 ```
