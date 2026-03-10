@@ -1,482 +1,586 @@
-import pandas as pd
+"""
+search.py — CISS Manager core search module
+
+Loads SAS tables for one or more years, filters by:
+  - Vehicle make / model (via legacy MAKE and MODEL numeric codes)
+  - Model year range (MODELYR)
+  - Damage plane (GAD1/GAD2 in event table)
+  - Delta-V range (applied to whichever DV columns are available)
+  - Vehicle contact only (optional toggle)
+
+All delta-V values in CISS are stored in km/h and converted to mph on output.
+CDC and EDR delta-V are reported in separate columns with an EDR_NOTE column.
+Cases where neither CDC nor EDR is available are excluded entirely.
+
+Returns a DataFrame of matching cases with a CrashViewer URL column.
+"""
+
 import os
-import numpy as np
+import math
+import pandas as pd
+import pyreadstat
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-DATA_DIR = r"C:\Users\andyd\Documents\ciss-tool\data"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-# Damage plane codes from FORMAT24.sas
-# We'll use these to build our dropdown later
-DAMAGE_PLANE_LABELS = {
-    'F': 'Front',
-    'B': 'Back',
-    'L': 'Left',
-    'R': 'Right',
-    'T': 'Top',
-    'U': 'Undercarriage',
-    'N': 'Noncollision',
-    '9': 'Unknown',
-    '0': 'Not a motor vehicle'
-}
+DATA_ROOT = r"C:\Users\andyd\Documents\ciss-tool\data"
 
-# MAKE codes from FORMAT24.sas - most common makes for dropdown
-MAKE_LABELS = {
-    6:  'Chrysler',
-    7:  'Dodge',
-    12: 'Ford',
-    13: 'Lincoln',
-    18: 'Buick',
-    19: 'Cadillac',
-    20: 'Chevrolet',
-    22: 'Pontiac',
-    23: 'GMC',
-    24: 'Saturn',
-    30: 'Volkswagen',
-    32: 'Audi',
-    34: 'BMW',
-    35: 'Nissan',
-    37: 'Honda',
-    38: 'Isuzu',
-    39: 'Jaguar',
-    41: 'Mazda',
-    42: 'Mercedes-Benz',
-    45: 'Porsche',
-    47: 'Saab',
-    48: 'Subaru',
-    49: 'Toyota',
-    51: 'Volvo',
-    52: 'Mitsubishi',
-    53: 'Suzuki',
-    54: 'Acura',
-    55: 'Hyundai',
-    58: 'Infiniti',
-    59: 'Lexus',
-    62: 'Land Rover',
-    63: 'Kia',
-    65: 'Smart',
-    67: 'Scion',
-    98: 'Other',
-    99: 'Unknown'
-}
+AVAILABLE_YEARS = list(range(2017, 2025))  # 2017-2024
+
+CRASHVIEWER_URL = "https://crashviewer.nhtsa.dot.gov/CISS/details/{}"
+
+KMH_TO_MPH = 0.621371
+
+# EDR sentinel values — treat as missing for that component
+EDR_SENTINEL = {888, 997}
+
+# CDCEVENT codes considered "related to this crash event"
+CDCEVENT_RELATED = set(range(1, 31)) | {95}
+
+# Years using OBJCONT (1-30 = vehicle contact) vs OBJCLASS (1 = vehicle)
+OBJCONT_YEARS = set(range(2017, 2024))   # 2017-2023
+OBJCLASS_YEARS = {2024}                   # 2024+
 
 
-# ============================================================
-# DROPDOWN POPULATION FUNCTIONS
-# ============================================================
-
-def get_all_makes(all_tables):
-    """
-    Scans GV tables across all loaded years and returns a
-    sorted dictionary of {make_code: make_label} for every
-    unique make present in the data.
-
-    'all_tables' is a dictionary of {year: tables} so we can
-    scan across all years at once and catch makes that might
-    only appear in certain years.
-    """
-    make_codes = set()  # a set automatically removes duplicates
-
-    for year, tables in all_tables.items():
-        # Get every unique MAKE code in this year's GV table
-        # dropna() removes any blank/null values
-        codes = tables['gv']['MAKE'].dropna().unique()
-        make_codes.update(codes)
-
-    # Build a dictionary mapping code -> label
-    # If the code exists in our MAKE_LABELS lookup use that label
-    # Otherwise fall back to just showing the raw code number
-    makes = {}
-    for code in sorted(make_codes):
-        code_int = int(code)
-        label = MAKE_LABELS.get(code_int, f"Make Code {code_int}")
-        makes[code_int] = label
-
-    # Sort the final dictionary alphabetically by label
-    # so the dropdown reads A-Z instead of by numeric code
-    makes_sorted = dict(
-        sorted(makes.items(), key=lambda item: item[1])
-    )
-
-    return makes_sorted
-
-
-def get_models_for_make(all_tables, make_code):
-    """
-    Given a make code, scans GV tables across all loaded years
-    and returns a sorted list of every unique model name
-    for that make.
-
-    This drives the second dropdown - once a user picks a make,
-    we call this to populate the model options.
-    """
-    models = set()
-
-    for year, tables in all_tables.items():
-        gv = tables['gv']
-
-        # Filter to just this make, then get unique model values
-        # We also decode any byte strings and strip whitespace
-        make_models = gv[gv['MAKE'] == float(make_code)]['MODEL'].dropna()
-        for model in make_models:
-            decoded = decode_bytes(model)
-            # Skip if the value is a float/number - these are
-            # null-like placeholder values, not real model names
-            if isinstance(decoded, float):
-                continue
-            if decoded and decoded.strip():
-                models.add(decoded.strip().upper())
-
-    return sorted(list(models))
-
-
-def get_year_range(all_tables):
-    """
-    Returns the min and max model years across all loaded data.
-    Used to set the bounds of the year range slider in the UI.
-    """
-    all_years = []
-
-    for year, tables in all_tables.items():
-        years = tables['gv']['MODELYR'].dropna()
-        all_years.extend(years.tolist())
-
-    return int(min(all_years)), int(max(all_years))
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
+# ---------------------------------------------------------------------------
+# Byte-string decoding helpers
+# ---------------------------------------------------------------------------
 
 def decode_bytes(value):
-    """
-    SAS files store some strings as bytes objects like b'F' or
-    b'1-10-2024-001-02'. This function converts them to regular
-    strings. If it's already a string or number, it passes
-    through unchanged.
-    """
     if isinstance(value, bytes):
-        return value.decode('utf-8').strip()
+        return value.decode("utf-8", errors="replace").strip()
     return value
 
 
-def decode_column(series):
-    """
-    Applies decode_bytes to an entire DataFrame column at once.
-    'series' is what pandas calls a single column.
-    """
+def decode_column(series: pd.Series) -> pd.Series:
     return series.apply(decode_bytes)
 
 
-# ============================================================
-# DATA LOADING
-# ============================================================
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
-def get_year_path(year):
-    return os.path.join(DATA_DIR, f"CISS_{year}_SAS_files")
-
-
-def load_tables(year):
-    """
-    Loads all needed tables for a given year and decodes
-    byte-string columns automatically.
-    """
-    path = get_year_path(year)
-    print(f"Loading {year} data...")
-
-    tables = {}
-    tables['gv']         = pd.read_sas(os.path.join(path, 'gv.sas7bdat'))
-    tables['event']      = pd.read_sas(os.path.join(path, 'event.sas7bdat'))
-    tables['cdc']        = pd.read_sas(os.path.join(path, 'cdc.sas7bdat'))
-    tables['edrcollect'] = pd.read_sas(os.path.join(path, 'edrcollect.sas7bdat'))
-    tables['edrevent']   = pd.read_sas(os.path.join(path, 'edrevent.sas7bdat'))
-
-    # Decode byte string columns in each table
-    # The event table uses VEHNUM instead of VEHNO - we rename
-    # it here so all tables use the same name for easier joining
-    tables['event'] = tables['event'].rename(columns={'VEHNUM': 'VEHNO'})
-
-    # Decode GAD1 and GAD2 in event table
-    tables['event']['GAD1'] = decode_column(tables['event']['GAD1'])
-    tables['event']['GAD2'] = decode_column(tables['event']['GAD2'])
-
-    # Decode VIN and CASENUMBER in gv table
-    tables['gv']['VIN']        = decode_column(tables['gv']['VIN'])
-    tables['gv']['CASENUMBER'] = decode_column(tables['gv']['CASENUMBER'])
-
-    return tables
+def get_year_path(year: int) -> str:
+    return os.path.join(DATA_ROOT, f"CISS_{year}_SAS_files")
 
 
-# ============================================================
-# DELTA-V CALCULATION
-# ============================================================
-
-def compute_edr_resultant(maxdvlong, maxdvlat):
-    """
-    EDR events only report lateral and longitudinal delta-V
-    components separately. This function computes the resultant
-    (total) delta-V using the Pythagorean theorem:
-    
-        resultant = sqrt(long^2 + lat^2)
-    
-    Both inputs can be negative (direction matters for components)
-    but the resultant is always a positive absolute value.
-    """
-    return np.sqrt(maxdvlong**2 + maxdvlat**2)
-
-
-# ============================================================
-# MAIN SEARCH FUNCTION
-# ============================================================
-
-def search_ciss(tables, make, model, year_min, year_max,
-                damage_plane, dv_min, dv_max):
-    """
-    Searches loaded CISS tables and returns matching cases.
-
-    Parameters:
-        tables      : dict of DataFrames from load_tables()
-        make        : int, MAKE code (e.g. 49 for Toyota)
-        model       : str, model name to search (e.g. 'CAMRY')
-        year_min    : int, earliest model year (e.g. 2018)
-        year_max    : int, latest model year (e.g. 2022)
-        damage_plane: str, GAD code (e.g. 'F' for Front)
-        dv_min      : float, minimum delta-V in search range
-        dv_max      : float, maximum delta-V in search range
-
-    Returns:
-        DataFrame of matching cases sorted by delta-V
-    """
-
-    # --- STEP 1: Filter GV table ---
-    # Start with the vehicle table and apply make/model/year filters
-    # The '&' means AND - all conditions must be true
-    # The '|' means OR - we'll use that later
-    gv = tables['gv']
-
-    gv_filtered = gv[
-        (gv['MAKE']    == make) &
-        (gv['MODEL'].str.upper().str.contains(model.upper(), na=False)) &
-        (gv['MODELYR'] >= year_min) &
-        (gv['MODELYR'] <= year_max)
-    ][['CASEID', 'VEHNO', 'MAKE', 'MODEL', 'MODELYR', 'VIN']].copy()
-
-    print(f"  Step 1 - GV filter: {len(gv_filtered)} vehicles match "
-          f"make/model/year")
-
-    if gv_filtered.empty:
-        print("  No vehicles found matching make/model/year criteria.")
+def _read(year_path: str, table_name: str, usecols=None) -> pd.DataFrame:
+    path = os.path.join(year_path, f"{table_name}.sas7bdat")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        df, _ = pyreadstat.read_sas7bdat(path, usecols=usecols)
+        return df
+    except Exception as e:
+        print(f"  Warning: could not read {path}: {e}")
         return pd.DataFrame()
 
 
-    # --- STEP 2: Filter EVENT table by damage plane ---
-    # A vehicle can appear in the event table in TWO ways:
-    #
-    # WAY 1: As VEHNUM (the first vehicle in the event)
-    #        → damage plane is stored in GAD1
-    #
-    # WAY 2: As the contacted vehicle (OBJCONT codes 1-30)
-    #        → damage plane is stored in GAD2
-    #
-    # We need to capture BOTH scenarios so we don't miss
-    # cases where our subject vehicle is in the second position
+def load_tables(year: int) -> dict:
+    yp = get_year_path(year)
 
-    event = tables['event']
+    gv = _read(yp, "gv", usecols=[
+        "CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR", "VIN",
+        "DAMPLANE", "DVTOTAL", "DVLONG", "DVLAT", "DVBASIS", "DVCONF",
+    ])
 
-    # Way 1: subject vehicle is VEHNUM, check GAD1
-    way1 = event[
-        event['GAD1'] == damage_plane
-    ][['CASEID', 'VEHNUM', 'GAD1']].copy()
-    way1 = way1.rename(columns={'VEHNUM': 'VEHNO', 'GAD1': 'MATCHED_GAD'})
+    # Load event table with all potentially needed columns
+    # OBJCONT used 2017-2023, OBJCLASS used 2024+
+    event_cols = ["CASEID", "VEHNUM", "EVENTNO", "CLASS1", "GAD1",
+                  "OBJCLASS", "OBJCONT", "CLASS2", "GAD2"]
+    event = _read(yp, "event", usecols=event_cols)
 
-    # Way 2: subject vehicle is OBJCONT (values 1-30 = vehicle numbers)
-    # check GAD2 for the damage plane
-    way2 = event[
-        (event['OBJCONT'].between(1, 30)) &
-        (event['GAD2'] == damage_plane)
-    ][['CASEID', 'OBJCONT', 'GAD2']].copy()
-    way2 = way2.rename(columns={
-        'OBJCONT': 'VEHNO',
-        'GAD2': 'MATCHED_GAD'
-    })
+    cdc = _read(yp, "cdc", usecols=[
+        "CASEID", "VEHNO", "EVENTNO", "DVTOTAL", "DVBASIS", "CDCPLANE",
+    ])
+    edrcollect = _read(yp, "edrcollect", usecols=[
+        "CASEID", "VEHNO", "EDROBTAINED", "EDRMETHOD",
+    ])
+    edrevent = _read(yp, "edrevent", usecols=[
+        "CASEID", "VEHNO", "EDRSUMMNO", "EDREVENTNO",
+        "MAXDVLONG", "MAXDVLAT", "CDCEVENT",
+    ])
+    crash = _read(yp, "crash", usecols=[
+        "CASEID", "CRASHYEAR", "PSU", "CASENO", "CASENUMBER", "VEHICLES",
+    ])
 
-    # Combine both and drop any duplicate CASEID/VEHNO pairs
-    # (a vehicle could theoretically match both ways in
-    # different events within the same crash)
-    event_filtered = pd.concat([way1, way2], ignore_index=True)
-    event_filtered = event_filtered.drop_duplicates(
-        subset=['CASEID', 'VEHNO']
-    )
+    if not event.empty and "VEHNUM" in event.columns:
+        event = event.rename(columns={"VEHNUM": "VEHNO"})
 
-    print(f"  Step 2 - Event filter: {len(event_filtered)} vehicles "
-          f"match damage plane '{damage_plane}' "
-          f"(Way1: {len(way1)}, Way2: {len(way2)})")
+    for df in [gv, event, cdc, edrcollect, edrevent, crash]:
+        if df.empty:
+            continue
+        for col in df.select_dtypes(include=["object"]).columns:
+            df[col] = decode_column(df[col])
 
-
-    # --- STEP 3: Join GV results with EVENT results ---
-    # 'merge' is pandas' way of joining two tables together
-    # 'on' specifies the columns to match on
-    # 'inner' means only keep rows that exist in BOTH tables
-    matched = gv_filtered.merge(
-        event_filtered,
-        on=['CASEID', 'VEHNO'],
-        how='inner'
-    )
-
-    print(f"  Step 3 - After joining GV + Event: {len(matched)} matches")
-
-    if matched.empty:
-        return pd.DataFrame()
+    return {
+        "gv": gv,
+        "event": event,
+        "cdc": cdc,
+        "edrcollect": edrcollect,
+        "edrevent": edrevent,
+        "crash": crash,
+    }
 
 
-    # --- STEP 4: Get CDC delta-V ---
-    # CDC table has DVTOTAL - the reconstructed resultant delta-V
-    # DVBASIS tells us how it was calculated
-    # We keep only the columns we need
-    cdc = tables['cdc'][
-        ['CASEID', 'VEHNO', 'DVTOTAL', 'DVBASIS', 'CDCPLANE']
+# ---------------------------------------------------------------------------
+# Delta-V helpers
+# ---------------------------------------------------------------------------
+
+def _clean_component(val) -> float | None:
+    """Return float value or None if sentinel/invalid."""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return None if f in EDR_SENTINEL else f
+
+
+def _resultant(long_val, lat_val) -> float | None:
+    """
+    Compute resultant from two EDR components, handling sentinels per-component.
+    Both sentinel -> None. One sentinel -> use the other alone. Neither -> Pythagorean.
+    Returns value in km/h (caller converts to mph).
+    """
+    lng = _clean_component(long_val)
+    lat = _clean_component(lat_val)
+
+    if lng is None and lat is None:
+        return None
+    if lng is None:
+        return abs(lat)
+    if lat is None:
+        return abs(lng)
+    return math.sqrt(lng ** 2 + lat ** 2)
+
+
+def get_cdc_dv_mph(caseid, vehno, cdc: pd.DataFrame,
+                   damage_plane: str | None = None):
+    """
+    Return (cdc_dv_mph, cdc_eventno) for the highest valid CDC delta-V.
+    When damage_plane is provided, filters to CDC rows where CDCPLANE matches
+    the searched plane so multi-event vehicles return the correct contact DV.
+    Excludes 999 sentinel. Converts km/h -> mph.
+    Returns (None, None) if unavailable.
+    """
+    if cdc.empty:
+        return None, None
+    rows = cdc[(cdc["CASEID"] == caseid) & (cdc["VEHNO"] == vehno)].copy()
+    if rows.empty:
+        return None, None
+
+    # Filter to the matching damage plane when specified
+    if damage_plane is not None and "CDCPLANE" in rows.columns:
+        dp = damage_plane.upper()
+        rows["CDCPLANE"] = decode_column(rows["CDCPLANE"].astype(str))
+        plane_rows = rows[rows["CDCPLANE"] == dp]
+        # Only apply the plane filter if it returns results — some vehicles may
+        # have CDC data but CDCPLANE not coded, so fall back to all rows
+        if not plane_rows.empty:
+            rows = plane_rows
+
+    rows["DVTOTAL"] = pd.to_numeric(rows["DVTOTAL"], errors="coerce")
+    rows = rows[rows["DVTOTAL"].notna() & (rows["DVTOTAL"] != 999)]
+    if rows.empty:
+        return None, None
+    idx = rows["DVTOTAL"].idxmax()
+    best_row = rows.loc[idx]
+    return float(best_row["DVTOTAL"]) * KMH_TO_MPH, best_row["EVENTNO"]
+
+
+def get_edr_dv_mph(caseid, vehno, edrcollect: pd.DataFrame,
+                   edrevent: pd.DataFrame, cdc_eventno,
+                   damage_plane: str | None):
+    """
+    Return (edr_dv_mph, edr_note) for a vehicle.
+
+    EDROBTAINED == 2  -> 5.0 mph, "EDR: No event recorded (<5 mph)"
+    EDROBTAINED == 1:
+      Single event:
+        CDCEVENT in 1-30 or 95 -> resultant, "EDR: Confirmed event"
+        CDCEVENT 97 or 99       -> resultant, "EDR: Single event, relatedness
+                                   uncertain — verify on CrashViewer"
+      Multiple events:
+        damage_plane provided   -> match by cdc_eventno; if none match,
+                                   (NaN, "EDR: No matching event")
+        damage_plane is None    -> (NaN, "EDR: Multiple events — verify on CrashViewer")
+    Not obtained / other        -> (None, None)
+
+    Components of 888 or 997 are treated as missing per-component.
+    All returned DV values are in mph.
+    """
+    if edrcollect.empty:
+        return None, None
+
+    row = edrcollect[
+        (edrcollect["CASEID"] == caseid) & (edrcollect["VEHNO"] == vehno)
+    ]
+    if row.empty:
+        return None, None
+
+    obtained = row.iloc[0]["EDROBTAINED"]
+    try:
+        obtained = int(obtained)
+    except (TypeError, ValueError):
+        return None, None
+
+    if obtained == 2:
+        return 5.0, "EDR: No event recorded (<5 mph)"
+
+    if obtained != 1:
+        return None, None
+
+    if edrevent.empty:
+        return None, None
+
+    events = edrevent[
+        (edrevent["CASEID"] == caseid) & (edrevent["VEHNO"] == vehno)
     ].copy()
+    if events.empty:
+        return None, None
 
-    # Rename DVTOTAL so we know it came from CDC
-    cdc = cdc.rename(columns={'DVTOTAL': 'CDC_DV'})
+    events["CDCEVENT"] = pd.to_numeric(events["CDCEVENT"], errors="coerce")
 
-    # Take the maximum CDC delta-V per vehicle in case there
-    # are multiple CDC events for the same vehicle
-    cdc_max = cdc.groupby(
-        ['CASEID', 'VEHNO']
-    )['CDC_DV'].max().reset_index()
-
-
-    # --- STEP 5: Get EDR delta-V ---
-    # First check if EDR was obtained (EDROBTAINED = 1 or 2)
-    edrcollect = tables['edrcollect']
-
-    edr_valid = edrcollect[
-        edrcollect['EDROBTAINED'].isin([1.0, 2.0])
-    ][['CASEID', 'VEHNO', 'EDROBTAINED']].copy()
-
-    # For EDROBTAINED = 2 (collected, no event = under 5 mph)
-    # we assign a delta-V of 0 as a placeholder
-    # For EDROBTAINED = 1 we get the actual value from edrevent
-    edrevent = tables['edrevent'].copy()
-
-    # Compute EDR resultant delta-V from components
-    edrevent['EDR_DV'] = compute_edr_resultant(
-        edrevent['MAXDVLONG'],
-        edrevent['MAXDVLAT']
-    )
-
-    # Take maximum EDR delta-V per vehicle across all events
-    edr_max = edrevent.groupby(
-        ['CASEID', 'VEHNO']
-    )['EDR_DV'].max().reset_index()
-
-    # Join EDR collection status with EDR event values
-    edr_combined = edr_valid.merge(
-        edr_max,
-        on=['CASEID', 'VEHNO'],
-        how='left'  # left keeps all valid EDR rows even if
-                    # no matching event (EDROBTAINED=2 case)
-    )
-
-    # Where EDROBTAINED=2 (no event recorded), fill EDR_DV with 0
-    edr_combined['EDR_DV'] = edr_combined['EDR_DV'].fillna(0)
-
-
-    # --- STEP 6: Join delta-V data onto matched vehicles ---
-    # Left join keeps all matched vehicles even if no CDC or EDR
-    matched = matched.merge(cdc_max,  on=['CASEID', 'VEHNO'], how='left')
-    matched = matched.merge(
-        edr_combined[['CASEID', 'VEHNO', 'EDROBTAINED', 'EDR_DV']],
-        on=['CASEID', 'VEHNO'],
-        how='left'
-    )
-
-
-    # --- STEP 7: Filter - must have CDC or valid EDR delta-V ---
-    # A vehicle qualifies if it has EITHER:
-    #   - A CDC delta-V value (not null)
-    #   - An EDR with EDROBTAINED of 1 or 2
-    has_cdc = matched['CDC_DV'].notna()
-    has_edr = matched['EDROBTAINED'].isin([1.0, 2.0])
-
-    matched = matched[has_cdc | has_edr].copy()
-
-    print(f"  Step 4-7 - After delta-V filter: {len(matched)} matches "
-          f"have CDC or EDR data")
-
-    if matched.empty:
-        return pd.DataFrame()
-
-
-    # --- STEP 8: Compute best available delta-V for ranging ---
-    # We prefer CDC_DV if available, otherwise use EDR_DV
-    # This gives us one delta-V value per row to filter against
-    matched['BEST_DV'] = matched['CDC_DV'].combine_first(
-        matched['EDR_DV']
-    )
-
-    # --- STEP 9: Apply delta-V range filter ---
-    matched = matched[
-        (matched['BEST_DV'] >= dv_min) &
-        (matched['BEST_DV'] <= dv_max)
-    ].copy()
-
-    print(f"  Step 9 - After delta-V range filter: {len(matched)} "
-          f"matches within {dv_min}-{dv_max} mph")
-
-    if matched.empty:
-        return pd.DataFrame()
-
-
-    # --- STEP 10: Add CrashViewer hyperlink ---
-    # The CISS CrashViewer URL pattern takes a CaseID
-    # We'll build a clickable link for each result
-    matched['CRASHVIEWER_URL'] = matched['CASEID'].apply(
-        lambda x: f"https://crashviewer.nhtsa.dot.gov/CISS/{int(x)}"
-    )
-
-
-    # --- STEP 11: Sort by BEST_DV ascending ---
-    matched = matched.sort_values('BEST_DV').reset_index(drop=True)
-
-
-    # --- STEP 12: Return clean final columns ---
-    return matched[[
-        'CASEID', 'VEHNO', 'MAKE', 'MODEL', 'MODELYR',
-        'VIN', 'GAD1', 'CDC_DV', 'EDR_DV', 'EDROBTAINED',
-        'BEST_DV', 'CRASHVIEWER_URL'
-    ]]
-
-
-# ============================================================
-# TEST RUN
-# ============================================================
-if __name__ == "__main__":
-
-    # Load all years into one dictionary
-    # This is the structure our dropdown functions expect
-    print("Loading all years...")
-    all_tables = {}
-    for year in range(2017, 2025):
+    # ---- Single event ----
+    if len(events) == 1:
+        ev = events.iloc[0]
+        r = _resultant(ev["MAXDVLONG"], ev["MAXDVLAT"])
+        if r is None:
+            return None, None
+        dv_mph = r * KMH_TO_MPH
         try:
-            all_tables[year] = load_tables(year)
-        except Exception as e:
-            print(f"  Could not load {year}: {e}")
+            cdcevent_int = int(ev["CDCEVENT"])
+        except (TypeError, ValueError):
+            cdcevent_int = None
 
-    # Test the make dropdown
-    print("\nBuilding make dropdown...")
-    makes = get_all_makes(all_tables)
-    print(f"Total unique makes found: {len(makes)}")
-    print("\nFirst 10 makes (alphabetical):")
-    for code, label in list(makes.items())[:10]:
-        print(f"  {code}: {label}")
+        if cdcevent_int in CDCEVENT_RELATED:
+            return round(dv_mph, 1), "EDR: Confirmed event"
+        else:
+            return round(dv_mph, 1), "EDR: Single event, relatedness uncertain — verify on CrashViewer"
 
-    # Test the model dropdown for Toyota (code 49)
-    print("\nModels available for Toyota (code 49):")
-    toyota_models = get_models_for_make(all_tables, 49)
-    print(toyota_models)
+    # ---- Multiple events ----
+    if damage_plane is None:
+        return None, "EDR: Multiple events — verify on CrashViewer"
 
-    # Test year range
-    yr_min, yr_max = get_year_range(all_tables)
-    print(f"\nModel year range across all data: {yr_min} - {yr_max}")
+    if cdc_eventno is not None:
+        try:
+            cdc_eventno_int = int(cdc_eventno)
+        except (TypeError, ValueError):
+            cdc_eventno_int = None
+
+        if cdc_eventno_int is not None:
+            matched = events[events["CDCEVENT"] == cdc_eventno_int]
+            if not matched.empty:
+                resultants = matched.apply(
+                    lambda r: _resultant(r["MAXDVLONG"], r["MAXDVLAT"]), axis=1
+                ).dropna()
+                if not resultants.empty:
+                    return round(float(resultants.max()) * KMH_TO_MPH, 1), "EDR: Matched to CDC event"
+
+    return None, "EDR: No matching event"
+
+
+# ---------------------------------------------------------------------------
+# Vehicle contact filter helper
+# ---------------------------------------------------------------------------
+
+def _vehicle_contact_caseids(event: pd.DataFrame, year: int,
+                              damage_plane: str) -> set:
+    """
+    Return a set of (CASEID, VEHNO) tuples where the damage-plane contact
+    was with another vehicle.
+
+    2017-2023: OBJCONT in 1-30 on the matching event row
+    2024+    : OBJCLASS == 1 on the matching event row
+    """
+    if event.empty:
+        return set()
+
+    dp = damage_plane.upper()
+
+    # Rows where this vehicle is the primary contact with the damage plane
+    primary = event[event["GAD1"] == dp].copy()
+    # Rows where this vehicle is the contacted vehicle for the damage plane
+    contacted = event[event["GAD2"] == dp].copy()
+
+    valid_pairs = set()
+
+    if year in OBJCONT_YEARS:
+        # OBJCONT 1-30 means the contacted object is a vehicle
+        if "OBJCONT" in primary.columns:
+            primary["OBJCONT"] = pd.to_numeric(primary["OBJCONT"], errors="coerce")
+            veh_primary = primary[primary["OBJCONT"].between(1, 30)]
+            for _, row in veh_primary.iterrows():
+                valid_pairs.add((row["CASEID"], row["VEHNO"]))
+
+        # For contacted vehicle rows: the primary vehicle (VEHNO) contacted
+        # this vehicle, so OBJCONT on the primary side is 1-30 — already
+        # captured above. But we also need to add the contacted vehicle itself.
+        if "OBJCONT" in event.columns:
+            event["OBJCONT"] = pd.to_numeric(event["OBJCONT"], errors="coerce")
+            contacted_rows = event[
+                (event["GAD2"] == dp) &
+                event["OBJCONT"].between(1, 30)
+            ]
+            for _, row in contacted_rows.iterrows():
+                # The contacted vehicle number is OBJCONT
+                try:
+                    contacted_vehno = int(row["OBJCONT"])
+                    valid_pairs.add((row["CASEID"], contacted_vehno))
+                except (TypeError, ValueError):
+                    pass
+
+    elif year in OBJCLASS_YEARS:
+        # OBJCLASS == 1 means the contacted object is a vehicle
+        if "OBJCLASS" in primary.columns:
+            primary["OBJCLASS"] = pd.to_numeric(primary["OBJCLASS"], errors="coerce")
+            veh_primary = primary[primary["OBJCLASS"] == 1]
+            for _, row in veh_primary.iterrows():
+                valid_pairs.add((row["CASEID"], row["VEHNO"]))
+
+        if "OBJCLASS" in event.columns:
+            event["OBJCLASS"] = pd.to_numeric(event["OBJCLASS"], errors="coerce")
+            contacted_rows = event[
+                (event["GAD2"] == dp) &
+                (event["OBJCLASS"] == 1)
+            ]
+            for _, row in contacted_rows.iterrows():
+                if "OBJCONT" in row and pd.notna(row["OBJCONT"]):
+                    try:
+                        contacted_vehno = int(row["OBJCONT"])
+                        valid_pairs.add((row["CASEID"], contacted_vehno))
+                    except (TypeError, ValueError):
+                        pass
+
+    return valid_pairs
+
+
+# ---------------------------------------------------------------------------
+# Main search function
+# ---------------------------------------------------------------------------
+
+def search_ciss(
+    make_code: int,
+    model_code: int | None,
+    modelyr_min: int | None,
+    modelyr_max: int | None,
+    damage_plane: str | None,
+    dv_min: float | None,
+    dv_max: float | None,
+    vehicle_contact_only: bool = False,
+    years: list[int] | None = None,
+) -> pd.DataFrame:
+    """
+    Search CISS data and return matching vehicle records.
+
+    Parameters
+    ----------
+    make_code            : int   - legacy MAKE numeric code (e.g. 49 = Toyota)
+    model_code           : int | None - legacy MODEL code; None = all models
+    modelyr_min          : int | None - minimum vehicle model year
+    modelyr_max          : int | None - maximum vehicle model year
+    damage_plane         : str | None - GAD code ('F','B','L','R','T','U'); None = any
+    dv_min               : float | None - minimum delta-V (mph); None = no lower bound
+    dv_max               : float | None - maximum delta-V (mph); None = no upper bound
+    vehicle_contact_only : bool - if True, only include cases where the damage
+                                  contact was with another vehicle (ignored if
+                                  damage_plane is None)
+    years                : list[int] | None - crash years to search; None = all
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        CASEID, VEHNO, MAKE, MODEL, MODELYR, VIN,
+        DAMAGE_PLANE, CDC_DV_MPH, EDR_DV_MPH, EDR_NOTE, CRASHVIEWER_URL
+
+    Cases where both CDC_DV_MPH and EDR_DV_MPH are NaN are excluded.
+    dv_min/dv_max filter uses CDC_DV_MPH, falling back to EDR_DV_MPH.
+    """
+    if years is None:
+        years = AVAILABLE_YEARS
+
+    results = []
+
+    for year in years:
+        print(f"Searching {year}...")
+        tables = load_tables(year)
+        gv = tables["gv"]
+        event = tables["event"]
+        cdc = tables["cdc"]
+        edrcollect = tables["edrcollect"]
+        edrevent = tables["edrevent"]
+
+        if gv.empty:
+            continue
+
+        # ------------------------------------------------------------------
+        # Step 1: Filter GV by make, model, and model year
+        # ------------------------------------------------------------------
+        gv["MAKE"] = pd.to_numeric(gv["MAKE"], errors="coerce")
+        mask = gv["MAKE"] == make_code
+
+        if model_code is not None:
+            gv["MODEL"] = pd.to_numeric(gv["MODEL"], errors="coerce")
+            mask &= gv["MODEL"] == model_code
+
+        if modelyr_min is not None:
+            gv["MODELYR"] = pd.to_numeric(gv["MODELYR"], errors="coerce")
+            mask &= gv["MODELYR"] >= modelyr_min
+
+        if modelyr_max is not None:
+            gv["MODELYR"] = pd.to_numeric(gv["MODELYR"], errors="coerce")
+            mask &= gv["MODELYR"] <= modelyr_max
+
+        vehicles = gv[mask].copy()
+        if vehicles.empty:
+            continue
+
+        # ------------------------------------------------------------------
+        # Step 2: Filter by damage plane via event table
+        # ------------------------------------------------------------------
+        if damage_plane is not None and not event.empty:
+            dp = damage_plane.upper()
+            event["GAD1"] = decode_column(event["GAD1"].astype(str))
+            event["GAD2"] = decode_column(event["GAD2"].astype(str))
+            event["OBJCONT"] = pd.to_numeric(event["OBJCONT"], errors="coerce") \
+                if "OBJCONT" in event.columns else pd.Series(dtype=float)
+
+            primary_match = event[event["GAD1"] == dp][["CASEID", "VEHNO"]].drop_duplicates()
+            contacted_match = event[event["GAD2"] == dp][["CASEID", "OBJCONT"]].rename(
+                columns={"OBJCONT": "VEHNO"}
+            ).dropna(subset=["VEHNO"])
+            contacted_match["VEHNO"] = contacted_match["VEHNO"].astype(int)
+            contacted_match = contacted_match.drop_duplicates()
+
+            damage_vehicles = pd.concat([primary_match, contacted_match]).drop_duplicates()
+            vehicles = vehicles.merge(damage_vehicles, on=["CASEID", "VEHNO"], how="inner")
+            if vehicles.empty:
+                continue
+
+            # --------------------------------------------------------------
+            # Step 2b: Vehicle contact filter (only when damage_plane set)
+            # --------------------------------------------------------------
+            if vehicle_contact_only:
+                valid_pairs = _vehicle_contact_caseids(event, year, dp)
+                if valid_pairs:
+                    keep = vehicles.apply(
+                        lambda r: (r["CASEID"], r["VEHNO"]) in valid_pairs, axis=1
+                    )
+                    vehicles = vehicles[keep]
+                    if vehicles.empty:
+                        continue
+
+        # ------------------------------------------------------------------
+        # Step 3: Compute CDC and EDR delta-V in mph
+        # ------------------------------------------------------------------
+        cdc_dvs = []
+        edr_dvs = []
+        edr_notes = []
+
+        for _, vrow in vehicles.iterrows():
+            caseid = vrow["CASEID"]
+            vehno = vrow["VEHNO"]
+
+            cdc_dv, cdc_eventno = get_cdc_dv_mph(caseid, vehno, cdc, damage_plane)
+            edr_dv, edr_note = get_edr_dv_mph(
+                caseid, vehno, edrcollect, edrevent, cdc_eventno, damage_plane
+            )
+
+            cdc_dvs.append(round(cdc_dv, 1) if cdc_dv is not None else None)
+            edr_dvs.append(edr_dv)
+            edr_notes.append(edr_note)
+
+        vehicles = vehicles.copy()
+        vehicles["CDC_DV_MPH"] = cdc_dvs
+        vehicles["EDR_DV_MPH"] = edr_dvs
+        vehicles["EDR_NOTE"] = edr_notes
+
+        # Exclude cases where both DV values are unavailable
+        has_any_dv = vehicles["CDC_DV_MPH"].notna() | vehicles["EDR_DV_MPH"].notna()
+        vehicles = vehicles[has_any_dv]
+        if vehicles.empty:
+            continue
+
+        # Apply optional delta-V range filter (CDC preferred, EDR fallback)
+        if dv_min is not None or dv_max is not None:
+            _cdc = vehicles["CDC_DV_MPH"].astype(float)
+            _edr = vehicles["EDR_DV_MPH"].astype(float)
+            best_for_filter = _cdc.combine_first(_edr)
+            dv_mask = best_for_filter.notna()
+            if dv_min is not None:
+                dv_mask &= best_for_filter >= dv_min
+            if dv_max is not None:
+                dv_mask &= best_for_filter <= dv_max
+            vehicles = vehicles[dv_mask]
+            if vehicles.empty:
+                continue
+
+        # ------------------------------------------------------------------
+        # Step 4: Clean up types, attach damage plane and CrashViewer URL
+        # ------------------------------------------------------------------
+        for col in ["CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR"]:
+            if col in vehicles.columns:
+                vehicles[col] = pd.to_numeric(vehicles[col], errors="coerce").astype("Int64")
+
+        vehicles["DAMAGE_PLANE"] = damage_plane if damage_plane else "Any"
+        vehicles["CRASHVIEWER_URL"] = vehicles["CASEID"].apply(
+            lambda c: CRASHVIEWER_URL.format(int(c))
+        )
+
+        results.append(vehicles[[
+            "CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR", "VIN",
+            "DAMAGE_PLANE", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "CRASHVIEWER_URL",
+        ]])
+
+    if not results:
+        return pd.DataFrame(columns=[
+            "CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR", "VIN",
+            "DAMAGE_PLANE", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "CRASHVIEWER_URL",
+        ])
+
+    results = [r for r in results if not r.empty]
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=[
+        "CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR", "VIN",
+        "DAMAGE_PLANE", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "CRASHVIEWER_URL",
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Quick CLI test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Test without vehicle contact filter
+    print("=== Without vehicle contact filter ===")
+    df = search_ciss(
+        make_code=49,
+        model_code=402,
+        modelyr_min=None,
+        modelyr_max=None,
+        damage_plane="F",
+        dv_min=None,
+        dv_max=None,
+        vehicle_contact_only=False,
+        years=[2024],
+    )
+    print(f"Results: {len(df)}")
+
+    # Test with vehicle contact filter
+    print("\n=== With vehicle contact filter ===")
+    df2 = search_ciss(
+        make_code=49,
+        model_code=402,
+        modelyr_min=None,
+        modelyr_max=None,
+        damage_plane="F",
+        dv_min=None,
+        dv_max=None,
+        vehicle_contact_only=True,
+        years=[2024],
+    )
+    print(f"Results: {len(df2)}")
+    if not df2.empty:
+        print(df2[[
+            "CASEID", "MODELYR", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "CRASHVIEWER_URL"
+        ]].to_string(index=False))
