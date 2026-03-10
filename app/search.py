@@ -24,7 +24,8 @@ import pyreadstat
 # Configuration
 # ---------------------------------------------------------------------------
 
-DATA_ROOT = r"C:\Users\andyd\Documents\ciss-tool\data"
+# Path relative to this file's location — works both locally and on Streamlit Cloud
+DATA_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 
 AVAILABLE_YEARS = list(range(2017, 2025))  # 2017-2024
 
