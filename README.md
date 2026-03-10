@@ -4,11 +4,14 @@ A Streamlit-based search tool for the [NHTSA Crash Investigation Sampling System
 
 **Live app:** [ciss-tool.streamlit.app](https://ciss-tool.streamlit.app)
 
+**Files for Basis:** [NHTSA File location](https://www.nhtsa.gov/file-downloads?p=nhtsa/downloads/CISS/) 
+**Reference Literature:** [CISS 2024 Analytical User's Handbook](https://crashstats.nhtsa.dot.gov/Api/Public/ViewPublication/813771)
+
 ---
 
 ## What It Does
 
-CISS Manager lets you search across CISS case years (2017–2024) by vehicle make, model, model year range, damage plane, and delta-V range. For each matching case it returns:
+CISS Manager lets you search across CISS case years (2017–2024) by vehicle make, model, model year range, damage plane, and delta-V range. As a note, this search tool is only for passenger vehicles within CISS. For each matching case it returns:
 
 - Case ID with a direct link to the NHTSA CrashViewer
 - Vehicle number within the case
@@ -62,7 +65,7 @@ The app uses the following SAS tables from each CISS year folder:
 | `edrevent` | EDR event delta-V components (longitudinal and lateral) |
 | `crash` | Top-level case info including crash year |
 
-Data covers CISS years 2017–2024. 2016 uses a different format and is excluded.
+Data covers CISS years 2017–2024. 2016 uses a different format and is excluded, it only includes a minimal subset of data due to overlap with NASS-CDS. When future years of data becomes published, those contents will need to be inserted and minor edits likely necessary.
 
 ---
 
