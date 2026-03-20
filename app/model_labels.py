@@ -1293,6 +1293,7 @@ MODEL_LABELS = {
         403: 'Veracruz (2007)',
         404: 'Kona',
         421: 'Veracruz (2008+)',
+        422: 'Palisade',
         441: 'Entourage',
         499: 'Unknown (light truck)',
     },
