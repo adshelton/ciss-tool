@@ -1292,6 +1292,7 @@ MODEL_LABELS = {
         402: 'Tucson',
         403: 'Veracruz (2007)',
         404: 'Kona',
+        406: 'Venue',
         421: 'Veracruz (2008+)',
         422: 'Palisade',
         441: 'Entourage',
