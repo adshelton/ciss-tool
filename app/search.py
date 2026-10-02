@@ -20,6 +20,8 @@ import math
 import pandas as pd
 import pyreadstat
 
+from vehicle_index import get_vehicle_index
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -38,6 +40,29 @@ EDR_SENTINEL = {888, 997}
 
 # CDCEVENT codes considered "related to this crash event"
 CDCEVENT_RELATED = set(range(1, 31)) | {95}
+
+# ROLLTYPE codes (gv table, one value per vehicle): 0 = no rollover;
+# 1, 2, 9 = rollover. Missing values are excluded from both rollover filters.
+ROLLOVER_CODES = {1, 2, 9}
+NO_ROLLOVER_CODE = 0
+
+# BAGDEPLOY codes (airbag table, one row per airbag) that count as a deployment.
+# A vehicle is "Yes" if any of its airbags has one of these codes, "No" if it
+# has airbag records but none deployed, and "Unknown" if it has no airbag
+# records at all. Unknown vehicles are excluded from both airbag filters.
+AIRBAG_DEPLOY_CODES = {1, 2, 3, 4}
+
+
+def airbag_deployment_status(airbag: pd.DataFrame) -> pd.DataFrame:
+    """Collapse the per-airbag table to one Yes/No row per CASEID/VEHNO."""
+    if airbag.empty:
+        return pd.DataFrame(columns=["CASEID", "VEHNO", "AIRBAG_DEPLOYED"])
+    ab = airbag[["CASEID", "VEHNO"]].copy()
+    ab["_dep"] = pd.to_numeric(airbag["BAGDEPLOY"], errors="coerce").isin(AIRBAG_DEPLOY_CODES)
+    status = ab.groupby(["CASEID", "VEHNO"], as_index=False)["_dep"].any()
+    status["AIRBAG_DEPLOYED"] = status["_dep"].map({True: "Yes", False: "No"})
+    return status.drop(columns="_dep")
+
 
 # Years using OBJCONT (1-30 = vehicle contact) vs OBJCLASS (1 = vehicle)
 OBJCONT_YEARS = set(range(2017, 2024))   # 2017-2023
@@ -84,6 +109,7 @@ def load_tables(year: int) -> dict:
     gv = _read(yp, "gv", usecols=[
         "CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR", "VIN",
         "DAMPLANE", "DVTOTAL", "DVLONG", "DVLAT", "DVBASIS", "DVCONF",
+        "ROLLTYPE",
     ])
 
     # Load event table with all potentially needed columns
@@ -102,6 +128,9 @@ def load_tables(year: int) -> dict:
         "CASEID", "VEHNO", "EDRSUMMNO", "EDREVENTNO",
         "MAXDVLONG", "MAXDVLAT", "CDCEVENT",
     ])
+    airbag = _read(yp, "airbag", usecols=[
+        "CASEID", "VEHNO", "BAGDEPLOY",
+    ])
     crash = _read(yp, "crash", usecols=[
         "CASEID", "CRASHYEAR", "PSU", "CASENO", "CASENUMBER", "VEHICLES",
     ])
@@ -109,7 +138,7 @@ def load_tables(year: int) -> dict:
     if not event.empty and "VEHNUM" in event.columns:
         event = event.rename(columns={"VEHNUM": "VEHNO"})
 
-    for df in [gv, event, cdc, edrcollect, edrevent, crash]:
+    for df in [gv, event, cdc, edrcollect, edrevent, airbag, crash]:
         if df.empty:
             continue
         for col in df.select_dtypes(include=["object"]).columns:
@@ -121,6 +150,7 @@ def load_tables(year: int) -> dict:
         "cdc": cdc,
         "edrcollect": edrcollect,
         "edrevent": edrevent,
+        "airbag": airbag,
         "crash": crash,
     }
 
@@ -362,8 +392,8 @@ def _vehicle_contact_caseids(event: pd.DataFrame, year: int,
 # ---------------------------------------------------------------------------
 
 def search_ciss(
-    make_code: int,
-    model_code: int | None,
+    make_key: str,
+    model_key: str | None,
     modelyr_min: int | None,
     modelyr_max: int | None,
     damage_plane: str | None,
@@ -371,19 +401,28 @@ def search_ciss(
     dv_max: float | None,
     vehicle_contact_only: bool = False,
     years: list[int] | None = None,
+    rollover: str = "all",
+    airbag_deploy: str = "all",
 ) -> pd.DataFrame:
     """
     Search CISS data and return matching vehicle records.
 
     Parameters
     ----------
-    make_code            : int   - legacy MAKE numeric code (e.g. 49 = Toyota)
-    model_code           : int | None - legacy MODEL code; None = all models
+    make_key             : str   - make key from vehicle_index (e.g. 'TOYOTA')
+    model_key            : str | None - model key from vehicle_index; None = all models
+                                  Make/model matching uses the VIN-decode files
+                                  (VINDERIVED / VPICDECODE) joined on CASEID + VEHNO.
+                                  Vehicles with no VIN-decode row are not searchable.
     modelyr_min          : int | None - minimum vehicle model year
     modelyr_max          : int | None - maximum vehicle model year
     damage_plane         : str | None - GAD code ('F','B','L','R','T','U'); None = any
     dv_min               : float | None - minimum delta-V (mph); None = no lower bound
     dv_max               : float | None - maximum delta-V (mph); None = no upper bound
+    rollover             : str - 'all' (default), 'none' (ROLLTYPE 0 only), or
+                                 'only' (ROLLTYPE 1, 2, 9)
+    airbag_deploy        : str - 'all' (default), 'yes' (any airbag BAGDEPLOY
+                                 1-4), or 'no' (airbag records, none deployed)
     vehicle_contact_only : bool - if True, only include cases where the damage
                                   contact was with another vehicle (ignored if
                                   damage_plane is None)
@@ -392,14 +431,22 @@ def search_ciss(
     Returns
     -------
     pd.DataFrame with columns:
-        CASEID, VEHNO, MAKE, MODEL, MODELYR, VIN,
-        DAMAGE_PLANE, CDC_DV_MPH, EDR_DV_MPH, EDR_NOTE, CRASHVIEWER_URL
+        CASEID, CASENUMBER, VEHNO, MAKE_NAME, MODEL_NAME, MODELYR, VIN,
+        DAMAGE_PLANE, CDC_DV_MPH, EDR_DV_MPH, EDR_NOTE, AIRBAG_DEPLOYED,
+        CRASHVIEWER_URL
 
     Cases where both CDC_DV_MPH and EDR_DV_MPH are NaN are excluded.
     dv_min/dv_max filter uses CDC_DV_MPH, falling back to EDR_DV_MPH.
     """
     if years is None:
         years = AVAILABLE_YEARS
+
+    # Vehicles matching the selected make/model, from the VIN-decode index
+    vidx = get_vehicle_index()
+    vmask = vidx["MAKE_KEY"] == make_key
+    if model_key is not None:
+        vmask &= vidx["MODEL_KEY"] == model_key
+    matched_vehicles = vidx.loc[vmask, ["YEAR", "CASEID", "VEHNO", "MAKE_NAME", "MODEL_NAME"]]
 
     results = []
 
@@ -415,15 +462,25 @@ def search_ciss(
         if gv.empty:
             continue
 
-        # ------------------------------------------------------------------
-        # Step 1: Filter GV by make, model, and model year
-        # ------------------------------------------------------------------
-        gv["MAKE"] = pd.to_numeric(gv["MAKE"], errors="coerce")
-        mask = gv["MAKE"] == make_code
+        # Airbag deployment status per vehicle (any airbag, any event)
+        gv = gv.merge(
+            airbag_deployment_status(tables["airbag"]),
+            on=["CASEID", "VEHNO"], how="left",
+        )
+        gv["AIRBAG_DEPLOYED"] = gv["AIRBAG_DEPLOYED"].fillna("Unknown")
 
-        if model_code is not None:
-            gv["MODEL"] = pd.to_numeric(gv["MODEL"], errors="coerce")
-            mask &= gv["MODEL"] == model_code
+        # ------------------------------------------------------------------
+        # Step 1: Filter GV by make/model (VIN-decode index) and model year
+        # ------------------------------------------------------------------
+        year_matches = matched_vehicles[matched_vehicles["YEAR"] == year].drop(columns="YEAR")
+        if year_matches.empty:
+            continue
+        gv["CASEID"] = pd.to_numeric(gv["CASEID"], errors="coerce").astype("Int64")
+        gv["VEHNO"] = pd.to_numeric(gv["VEHNO"], errors="coerce").astype("Int64")
+        gv = gv.merge(year_matches, on=["CASEID", "VEHNO"], how="inner")
+        if gv.empty:
+            continue
+        mask = pd.Series(True, index=gv.index)
 
         if modelyr_min is not None:
             gv["MODELYR"] = pd.to_numeric(gv["MODELYR"], errors="coerce")
@@ -432,6 +489,21 @@ def search_ciss(
         if modelyr_max is not None:
             gv["MODELYR"] = pd.to_numeric(gv["MODELYR"], errors="coerce")
             mask &= gv["MODELYR"] <= modelyr_max
+
+        # Airbag filter (status attached above; covers all events for vehicle)
+        if airbag_deploy == "yes":
+            mask &= gv["AIRBAG_DEPLOYED"] == "Yes"
+        elif airbag_deploy == "no":
+            mask &= gv["AIRBAG_DEPLOYED"] == "No"
+
+        # Rollover filter — ROLLTYPE is vehicle-level, so it covers all events
+        # for this CASEID/VEHNO, not just the event matching the damage plane.
+        if rollover in ("none", "only"):
+            rolltype = pd.to_numeric(gv["ROLLTYPE"], errors="coerce")
+            if rollover == "none":
+                mask &= rolltype == NO_ROLLOVER_CODE
+            else:
+                mask &= rolltype.isin(ROLLOVER_CODES)
 
         vehicles = gv[mask].copy()
         if vehicles.empty:
@@ -518,8 +590,17 @@ def search_ciss(
                 continue
 
         # ------------------------------------------------------------------
-        # Step 4: Clean up types, attach damage plane and CrashViewer URL
+        # Step 4: Attach CASENUMBER, clean up types, damage plane, CrashViewer URL
         # ------------------------------------------------------------------
+        crash = tables["crash"]
+        if not crash.empty and "CASENUMBER" in crash.columns:
+            vehicles = vehicles.merge(
+                crash[["CASEID", "CASENUMBER"]].drop_duplicates("CASEID"),
+                on="CASEID", how="left",
+            )
+        else:
+            vehicles["CASENUMBER"] = None
+
         for col in ["CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR"]:
             if col in vehicles.columns:
                 vehicles[col] = pd.to_numeric(vehicles[col], errors="coerce").astype("Int64")
@@ -530,20 +611,20 @@ def search_ciss(
         )
 
         results.append(vehicles[[
-            "CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR", "VIN",
-            "DAMAGE_PLANE", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "CRASHVIEWER_URL",
+            "CASEID", "CASENUMBER", "VEHNO", "MAKE_NAME", "MODEL_NAME", "MODELYR", "VIN",
+            "DAMAGE_PLANE", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "AIRBAG_DEPLOYED", "CRASHVIEWER_URL",
         ]])
 
     if not results:
         return pd.DataFrame(columns=[
-            "CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR", "VIN",
-            "DAMAGE_PLANE", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "CRASHVIEWER_URL",
+            "CASEID", "CASENUMBER", "VEHNO", "MAKE_NAME", "MODEL_NAME", "MODELYR", "VIN",
+            "DAMAGE_PLANE", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "AIRBAG_DEPLOYED", "CRASHVIEWER_URL",
         ])
 
     results = [r for r in results if not r.empty]
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=[
-        "CASEID", "VEHNO", "MAKE", "MODEL", "MODELYR", "VIN",
-        "DAMAGE_PLANE", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "CRASHVIEWER_URL",
+        "CASEID", "CASENUMBER", "VEHNO", "MAKE_NAME", "MODEL_NAME", "MODELYR", "VIN",
+        "DAMAGE_PLANE", "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "AIRBAG_DEPLOYED", "CRASHVIEWER_URL",
     ])
 
 
@@ -555,8 +636,8 @@ if __name__ == "__main__":
     # Test without vehicle contact filter
     print("=== Without vehicle contact filter ===")
     df = search_ciss(
-        make_code=49,
-        model_code=402,
+        make_key="TOYOTA",
+        model_key="CAMRY",
         modelyr_min=None,
         modelyr_max=None,
         damage_plane="F",
@@ -570,8 +651,8 @@ if __name__ == "__main__":
     # Test with vehicle contact filter
     print("\n=== With vehicle contact filter ===")
     df2 = search_ciss(
-        make_code=49,
-        model_code=402,
+        make_key="TOYOTA",
+        model_key="CAMRY",
         modelyr_min=None,
         modelyr_max=None,
         damage_plane="F",

@@ -13,7 +13,10 @@ import streamlit as st
 import pandas as pd
 
 from search import search_ciss, AVAILABLE_YEARS
-from model_labels import MODEL_LABELS
+from vehicle_index import (
+    get_vehicle_index, build_make_model_options,
+    get_make_options, get_model_options,
+)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -242,67 +245,6 @@ footer {
 # Build make / model lookup structures
 # ---------------------------------------------------------------------------
 
-MAKE_LABELS = {
-    1:  "American Motors",
-    2:  "Jeep / Kaiser-Jeep / Willys- Jeep",
-    3:  "AM General",
-    6:  "Chrysler",
-    7:  "Dodge",
-    8:  "Imperial",
-    9:  "Plymouth",
-    10: "Eagle",
-    12: "Ford",
-    13: "Lincoln",
-    14: "Mercury",
-    18: "Buick / Opel",
-    19: "Cadillac",
-    20: "Chevrolet",
-    21: "Oldsmobile",
-    22: "Pontiac",
-    23: "GMC",
-    24: "Saturn",
-    25: "Grumman",
-    26: "Coda",
-    29: "Other Domestic Manufacturers",
-    30: "Volkswagen",
-    31: "Alfa Romeo",
-    32: "Audi",
-    33: "Austin/Austin Healey",
-    34: "BMW",
-    35: "Nissan/Datsun",
-    36: "Fiat",
-    37: "Honda",
-    38: "Isuzu",
-    39: "Jaguar",
-    40: "Lancia",
-    41: "Mazda",
-    42: "Mercedes-Benz",
-    43: "MG",
-    44: "Peugeot",
-    45: "Porsche",
-    46: "Renault",
-    47: "Saab",
-    48: "Subaru",
-    49: "Toyota",
-    50: "Triumph",
-    51: "Volvo",
-    52: "Mitsubishi",
-    53: "Suzuki",
-    54: "Acura",
-    55: "Hyundai",
-    56: "Merkur",
-    57: "Yugo",
-    58: "Infiniti",
-    59: "Lexus",
-    60: "Daihatsu",
-    61: "Sterling",
-    62: "Land Rover",
-    63: "KIA",
-    64: "Daewoo",
-    65: "Smart",
-    67: "Scion",
-    69: "Other Import",
-}
 
 DAMAGE_PLANE_OPTIONS = {
     "Any":           None,
@@ -314,22 +256,26 @@ DAMAGE_PLANE_OPTIONS = {
     "Undercarriage": "U",
 }
 
-AVAILABLE_MAKE_CODES = sorted(MODEL_LABELS.keys())
-MAKE_OPTIONS = {MAKE_LABELS.get(k, f"Make {k}"): k for k in AVAILABLE_MAKE_CODES}
-SORTED_MAKE_OPTIONS = dict(sorted(MAKE_OPTIONS.items()))
+AIRBAG_OPTIONS = {
+    "All Cases":               "all",
+    "Airbag Deployment":       "yes",
+    "No Airbag Deployment":    "no",
+}
+
+ROLLOVER_OPTIONS = {
+    "All Cases":      "all",
+    "No Rollovers":   "none",
+    "Only Rollovers": "only",
+}
+
+@st.cache_data(show_spinner=False)
+def load_make_model_options() -> pd.DataFrame:
+    """All make/model combinations from the VIN-decode files (cached)."""
+    return build_make_model_options(get_vehicle_index())
 
 
-def get_model_options(make_code: int) -> dict:
-    models = MODEL_LABELS.get(make_code, {})
-    def sort_key(item):
-        label = item[1]
-        if label.lower().startswith("other") or label.lower().startswith("unknown"):
-            return "zzz" + label
-        return label
-    sorted_models = sorted(models.items(), key=sort_key)
-    options = {"All Models": None}
-    options.update({label: code for code, label in sorted_models})
-    return options
+MAKE_MODEL_OPTIONS = load_make_model_options()
+SORTED_MAKE_OPTIONS = get_make_options(MAKE_MODEL_OPTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -359,18 +305,21 @@ with col1:
         index=None,
         placeholder="Type or select a make...",
     )
-    make_code = SORTED_MAKE_OPTIONS.get(selected_make_label)
+    make_key = SORTED_MAKE_OPTIONS.get(selected_make_label)
 
 with col2:
-    model_options = get_model_options(make_code) if make_code is not None else {"All Models": None}
+    model_options = (
+        get_model_options(MAKE_MODEL_OPTIONS, make_key)
+        if make_key is not None else {"All Models": None}
+    )
     selected_model_label = st.selectbox(
         "Model",
         options=list(model_options.keys()),
         index=None,
         placeholder="Type or select a model...",
-        disabled=(make_code is None),
+        disabled=(make_key is None),
     )
-    model_code = model_options.get(selected_model_label)
+    model_key = model_options.get(selected_model_label)
 
 with col3:
     selected_plane_label = st.selectbox(
@@ -405,6 +354,28 @@ with col7:
         value=None, placeholder="Any", step=1.0,
     )
 
+col10, col11, _, _ = st.columns(4)
+
+with col10:
+    selected_rollover_label = st.selectbox(
+        "Rollover",
+        options=list(ROLLOVER_OPTIONS.keys()),
+        index=0,
+        help="Based on GV ROLLTYPE for the vehicle (covers all of its events). "
+             "Vehicles with unknown rollover status appear only under All Cases.",
+    )
+    rollover = ROLLOVER_OPTIONS[selected_rollover_label]
+
+with col11:
+    selected_airbag_label = st.selectbox(
+        "Airbags",
+        options=list(AIRBAG_OPTIONS.keys()),
+        index=0,
+        help="Deployment = any airbag on the vehicle with BAGDEPLOY 1-4, in any "
+             "event. Vehicles with no airbag records appear only under All Cases.",
+    )
+    airbag_deploy = AIRBAG_OPTIONS[selected_airbag_label]
+
 col8, col9 = st.columns([3, 1])
 
 with col8:
@@ -429,14 +400,14 @@ if search_clicked:
     elif dv_min and dv_max and dv_min > dv_max:
         st.error("Delta-V Min cannot be greater than Delta-V Max.")
     else:
-        if make_code is None:
+        if make_key is None:
             st.error("Please select a make before searching.")
         else:
             with st.spinner(f"Searching CISS {AVAILABLE_YEARS[0]}–{AVAILABLE_YEARS[-1]}..."):
                 try:
                     df = search_ciss(
-                        make_code=make_code,
-                        model_code=model_code,
+                        make_key=make_key,
+                        model_key=model_key,
                         modelyr_min=int(modelyr_min) if modelyr_min else None,
                         modelyr_max=int(modelyr_max) if modelyr_max else None,
                         damage_plane=damage_plane,
@@ -444,6 +415,8 @@ if search_clicked:
                         dv_max=float(dv_max) if dv_max else None,
                         vehicle_contact_only=vehicle_contact_only,
                         years=AVAILABLE_YEARS,
+                        rollover=rollover,
+                        airbag_deploy=airbag_deploy,
                     )
                     st.session_state["results"] = df
                     model_display = selected_model_label if selected_model_label else "All Models"
@@ -451,6 +424,8 @@ if search_clicked:
                         f"{selected_make_label} {model_display}"
                         f" · {selected_plane_label} plane"
                         f"{' · Vehicle contacts only' if vehicle_contact_only else ''}"
+                        f"{' · ' + selected_rollover_label if rollover != 'all' else ''}"
+                        f"{' · ' + selected_airbag_label if airbag_deploy != 'all' else ''}"
                     )
                 except Exception as e:
                     st.error(f"Search failed: {e}")
@@ -478,18 +453,20 @@ if "results" in st.session_state and st.session_state["results"] is not None:
         )
 
         display_df = df[[
-            "CASEID", "VEHNO", "MODELYR",
-            "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE",
+            "CASEID", "CASENUMBER", "VEHNO", "MODELYR",
+            "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "AIRBAG_DEPLOYED",
             "CRASHVIEWER_URL",
         ]].copy()
 
         display_df = display_df.rename(columns={
             "CASEID":          "Case ID",
+            "CASENUMBER":      "Case Number",
             "VEHNO":           "Veh #",
             "MODELYR":         "Model Year",
             "CDC_DV_MPH":      "CDC ΔV (mph)",
             "EDR_DV_MPH":      "EDR ΔV (mph)",
             "EDR_NOTE":        "EDR Note",
+            "AIRBAG_DEPLOYED": "Airbag Deployment",
             "CRASHVIEWER_URL": "CrashViewer",
         })
 
