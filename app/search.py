@@ -393,7 +393,7 @@ def _vehicle_contact_caseids(event: pd.DataFrame, year: int,
 
 def search_ciss(
     make_key: str,
-    model_key: str | None,
+    model_keys: list[str] | None,
     modelyr_min: int | None,
     modelyr_max: int | None,
     damage_plane: str | None,
@@ -410,7 +410,8 @@ def search_ciss(
     Parameters
     ----------
     make_key             : str   - make key from vehicle_index (e.g. 'TOYOTA')
-    model_key            : str | None - model key from vehicle_index; None = all models
+    model_keys           : list[str] | None - model keys from vehicle_index; any
+                                  of them may match. None or [] = all models
                                   Make/model matching uses the VIN-decode files
                                   (VINDERIVED / VPICDECODE) joined on CASEID + VEHNO.
                                   Vehicles with no VIN-decode row are not searchable.
@@ -444,8 +445,8 @@ def search_ciss(
     # Vehicles matching the selected make/model, from the VIN-decode index
     vidx = get_vehicle_index()
     vmask = vidx["MAKE_KEY"] == make_key
-    if model_key is not None:
-        vmask &= vidx["MODEL_KEY"] == model_key
+    if model_keys:
+        vmask &= vidx["MODEL_KEY"].isin(model_keys)
     matched_vehicles = vidx.loc[vmask, ["YEAR", "CASEID", "VEHNO", "MAKE_NAME", "MODEL_NAME"]]
 
     results = []
@@ -637,7 +638,7 @@ if __name__ == "__main__":
     print("=== Without vehicle contact filter ===")
     df = search_ciss(
         make_key="TOYOTA",
-        model_key="CAMRY",
+        model_keys=["CAMRY"],
         modelyr_min=None,
         modelyr_max=None,
         damage_plane="F",
@@ -652,7 +653,7 @@ if __name__ == "__main__":
     print("\n=== With vehicle contact filter ===")
     df2 = search_ciss(
         make_key="TOYOTA",
-        model_key="CAMRY",
+        model_keys=["CAMRY"],
         modelyr_min=None,
         modelyr_max=None,
         damage_plane="F",

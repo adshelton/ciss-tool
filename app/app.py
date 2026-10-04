@@ -104,6 +104,7 @@ html, body, [class*="css"] {
 
 /* ---- Widget labels ---- */
 div[data-testid="stSelectbox"] label,
+div[data-testid="stMultiSelect"] label,
 div[data-testid="stNumberInput"] label,
 div[data-testid="stToggle"] label {
     font-size: 0.75rem !important;
@@ -113,8 +114,16 @@ div[data-testid="stToggle"] label {
     letter-spacing: 0.05em !important;
 }
 
+/* ---- Multi-select tags (selected models) ---- */
+div[data-testid="stMultiSelect"] span[data-baseweb="tag"],
+div[data-testid="stMultiSelect"] span[data-tag] {
+    background-color: var(--primary) !important;
+    border-radius: 4px !important;
+}
+
 /* ---- Select / input boxes ---- */
 div[data-testid="stSelectbox"] > div > div,
+div[data-testid="stMultiSelect"] > div > div,
 div[data-testid="stNumberInput"] input {
     background-color: #F9FAFB !important;
     border: 1px solid var(--border) !important;
@@ -123,6 +132,7 @@ div[data-testid="stNumberInput"] input {
     font-size: 0.875rem !important;
 }
 div[data-testid="stSelectbox"] > div > div:focus-within,
+div[data-testid="stMultiSelect"] > div > div:focus-within,
 div[data-testid="stNumberInput"] input:focus {
     border-color: var(--primary) !important;
     box-shadow: 0 0 0 3px rgba(44,90,160,0.12) !important;
@@ -310,16 +320,16 @@ with col1:
 with col2:
     model_options = (
         get_model_options(MAKE_MODEL_OPTIONS, make_key)
-        if make_key is not None else {"All Models": None}
+        if make_key is not None else {}
     )
-    selected_model_label = st.selectbox(
+    selected_model_labels = st.multiselect(
         "Model",
         options=list(model_options.keys()),
-        index=None,
-        placeholder="Type or select a model...",
+        placeholder="All models (or select one or more)",
         disabled=(make_key is None),
+        key=f"models_{make_key}",  # reset selections when the make changes
     )
-    model_key = model_options.get(selected_model_label)
+    model_keys = [model_options[m] for m in selected_model_labels]
 
 with col3:
     selected_plane_label = st.selectbox(
@@ -407,7 +417,7 @@ if search_clicked:
                 try:
                     df = search_ciss(
                         make_key=make_key,
-                        model_key=model_key,
+                        model_keys=model_keys,
                         modelyr_min=int(modelyr_min) if modelyr_min else None,
                         modelyr_max=int(modelyr_max) if modelyr_max else None,
                         damage_plane=damage_plane,
@@ -419,7 +429,13 @@ if search_clicked:
                         airbag_deploy=airbag_deploy,
                     )
                     st.session_state["results"] = df
-                    model_display = selected_model_label if selected_model_label else "All Models"
+                    st.session_state["export_file_name"] = (
+                        f"ciss_{selected_make_label}_"
+                        f"{'_'.join(selected_model_labels) if selected_model_labels else 'All_Models'}.csv"
+                    ).replace(" ", "_").replace("/", "-")
+                    model_display = (
+                        ", ".join(selected_model_labels) if selected_model_labels else "All Models"
+                    )
                     st.session_state["search_label"] = (
                         f"{selected_make_label} {model_display}"
                         f" · {selected_plane_label} plane"
@@ -453,7 +469,7 @@ if "results" in st.session_state and st.session_state["results"] is not None:
         )
 
         display_df = df[[
-            "CASEID", "CASENUMBER", "VEHNO", "MODELYR",
+            "CASEID", "CASENUMBER", "VEHNO", "MODEL_NAME", "MODELYR",
             "CDC_DV_MPH", "EDR_DV_MPH", "EDR_NOTE", "AIRBAG_DEPLOYED",
             "CRASHVIEWER_URL",
         ]].copy()
@@ -462,6 +478,7 @@ if "results" in st.session_state and st.session_state["results"] is not None:
             "CASEID":          "Case ID",
             "CASENUMBER":      "Case Number",
             "VEHNO":           "Veh #",
+            "MODEL_NAME":      "Model",
             "MODELYR":         "Model Year",
             "CDC_DV_MPH":      "CDC ΔV (mph)",
             "EDR_DV_MPH":      "EDR ΔV (mph)",
@@ -506,10 +523,11 @@ if "results" in st.session_state and st.session_state["results"] is not None:
 """, unsafe_allow_html=True)
 
         csv = display_df.to_csv(index=False)
+        export_file_name = st.session_state.get("export_file_name", "ciss_results.csv")
         st.download_button(
             label="⬇  Export CSV",
             data=csv,
-            file_name=f"ciss_{selected_make_label}_{selected_model_label}.csv".replace(" ", "_"),
+            file_name=export_file_name,
             mime="text/csv",
         )
 

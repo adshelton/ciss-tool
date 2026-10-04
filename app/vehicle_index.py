@@ -149,7 +149,7 @@ def build_make_model_options(index: pd.DataFrame) -> pd.DataFrame:
     """
     Every unique make/model combination in the index, with a vehicle count.
     Blank makes and models are left out of the dropdown list (vehicles with
-    a blank model are still found when searching 'All Models').
+    a blank model are still found when no model is selected).
 
     Returns
     -------
@@ -174,11 +174,9 @@ def get_make_options(options: pd.DataFrame) -> dict:
 
 
 def get_model_options(options: pd.DataFrame, make_key: str) -> dict:
-    """{model display name: model key} for one make, with 'All Models' first."""
+    """{model display name: model key} for one make, alphabetical."""
     models = options[options["MAKE_KEY"] == make_key]
-    out = {"All Models": None}
-    out.update(dict(zip(models["MODEL_NAME"], models["MODEL_KEY"])))
-    return out
+    return dict(zip(models["MODEL_NAME"], models["MODEL_KEY"]))
 
 
 if __name__ == "__main__":
@@ -187,4 +185,4 @@ if __name__ == "__main__":
     print(f"Vehicles indexed: {len(index)}")
     print(f"Makes: {options['MAKE_KEY'].nunique()}   Make/model combinations: {len(options)}")
     toyota = get_model_options(options, "TOYOTA")
-    print(f"Toyota models ({len(toyota) - 1}): {list(toyota)[:12]} ...")
+    print(f"Toyota models ({len(toyota)}): {list(toyota)[:12]} ...")
